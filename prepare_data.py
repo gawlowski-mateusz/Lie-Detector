@@ -25,7 +25,37 @@ bands = {
     "gamma": (30, 45)
 }
 
+# Block mapping for experiment phases
+block_mapping = {
+    "HONEST_RESPONSE_TO_TRUE_IDENTITY": 1,    # Block 1: Truth about true identity
+    "DECEITFUL_RESPONSE_TO_TRUE_IDENTITY": 2, # Block 2: Lie about true identity
+    "HONEST_RESPONSE_TO_FAKE_IDENTITY": 3,    # Block 3: Truth about fake identity
+    "DECEITFUL_RESPONSE_TO_FAKE_IDENTITY": 4  # Block 4: Lie about fake identity
+}
+
 # Helper functions
+def is_control_trial(annotations):
+    """Check if the trial is a control trial with known/random data."""
+    return any('control' in str(annot).lower() for annot in annotations)
+
+def validate_participant_data(uuid, files):
+    """Verify that participant has all required experimental blocks."""
+    required_blocks = [
+        "HONEST_RESPONSE_TO_TRUE_IDENTITY",
+        "DECEITFUL_RESPONSE_TO_TRUE_IDENTITY",
+        "HONEST_RESPONSE_TO_FAKE_IDENTITY",
+        "DECEITFUL_RESPONSE_TO_FAKE_IDENTITY"
+    ]
+    return all(any(block in f for f in files) for block in required_blocks)
+
+def calculate_signal_quality(raw_data):
+    """Calculate basic signal quality metrics."""
+    return {
+        "signal_mean": np.mean(raw_data),
+        "signal_std": np.std(raw_data),
+        "signal_noise_ratio": np.mean(np.abs(raw_data)) / np.std(raw_data)
+    }
+
 def bandpower_epoch(epoch_data, sfreq, band):
     """Compute relative bandpower for a single EEG epoch (np.array)."""
     low, high = band
@@ -41,10 +71,25 @@ def bandpower_epoch(epoch_data, sfreq, band):
 
 def extract_features_from_epoch(data, sfreq):
     """Extract bandpower features from one EEG epoch (numpy array)."""
-    feats = {}
+    features = {}
+    
+    # Basic band powers
+    band_powers = {}
     for band_name, freq_range in bands.items():
-        feats[f"{band_name}_power"] = bandpower_epoch(data, sfreq, freq_range).mean()
-    return feats
+        power = bandpower_epoch(data, sfreq, freq_range).mean()
+        band_powers[band_name] = power
+        features[f"{band_name}_power"] = power
+    
+    # Power ratios (useful for detecting cognitive states)
+    features["theta_alpha_ratio"] = band_powers["theta"] / (band_powers["alpha"] + 1e-10)
+    features["beta_alpha_ratio"] = band_powers["beta"] / (band_powers["alpha"] + 1e-10)
+    features["gamma_beta_ratio"] = band_powers["gamma"] / (band_powers["beta"] + 1e-10)
+    
+    # Signal characteristics
+    features["signal_complexity"] = np.std(data) / np.mean(np.abs(data))
+    features["peak_frequency"] = np.argmax(np.abs(np.fft.fft(data))) * sfreq / len(data)
+    
+    return features
 
 # Load Metadata
 metadata = pd.read_excel(METADATA_FILE)
@@ -78,11 +123,13 @@ for uuid in subject_folders:
         sex, age = None, None
         print(f" -> No metadata found for {uuid}")
 
+    # Validate participant data
+    subject_files = [f for f in os.listdir(subject_path) if f.endswith(".fif")]
+    if not validate_participant_data(uuid, subject_files):
+        print(f" -> Warning: Participant {uuid} missing some experimental blocks")
+    
     # Process EEG files
-    for fif_file in os.listdir(subject_path):
-        if not fif_file.endswith(".fif"):
-            continue
-
+    for fif_file in subject_files:
         fif_path = os.path.join(subject_path, fif_file)
         print(f"Processing: participant={uuid}, file={fif_file}")
 
@@ -91,6 +138,9 @@ for uuid in subject_folders:
             raw = mne.io.read_raw_fif(fif_path, preload=True, verbose=False)
             raw.pick("eeg")
             raw.filter(0.5, 45., fir_design='firwin', verbose=False)
+            
+            # Calculate signal quality metrics
+            signal_quality = calculate_signal_quality(raw.get_data())
 
             # Extract epochs
             events, event_id = mne.events_from_annotations(raw, verbose=False)
@@ -117,13 +167,20 @@ for uuid in subject_folders:
             # Extract features for all epochs
             for ep_data in data:
                 feature = extract_features_from_epoch(ep_data, sfreq)
+                # Get block number and check for control trial
+                block_num = next((num for name, num in block_mapping.items() if name in fif_file), None)
+                
                 feature.update({
                     "UUID": uuid,
                     "File": fif_file,
+                    "Block": block_num,
                     "Sex": sex,
                     "Age": age,
                     "Condition": condition,
-                    "Label": label
+                    "Label": label,
+                    "Signal_Quality": signal_quality["signal_mean"],
+                    "Signal_Noise": signal_quality["signal_std"],
+                    "SNR": signal_quality["signal_noise_ratio"]
                 })
                 all_features.append(feature)
 
